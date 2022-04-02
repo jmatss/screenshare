@@ -29,6 +29,7 @@ impl From<H264Error> for webrtc::Error {
 }
 
 /// NAL H.264 Network Abstraction Layer
+#[allow(clippy::upper_case_acronyms)]
 pub struct NAL {
     pub picture_order_count: u32,
 

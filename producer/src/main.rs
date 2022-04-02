@@ -1,4 +1,11 @@
-use std::{collections::HashMap, error::Error, fs, io, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fs, io,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_tungstenite::{
     stream::Stream,
@@ -24,12 +31,12 @@ use webrtc::{
         media_engine::{MediaEngine, MIME_TYPE_H264},
         APIBuilder,
     },
-    ice_transport::ice_server::RTCIceServer,
+    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     media::Sample,
     peer_connection::{
-        configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
-        RTCPeerConnection,
+        configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription, RTCPeerConnection,
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
     track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
@@ -40,25 +47,25 @@ use crate::message::{Message, RTCIceCandidateInitFix};
 mod h264;
 mod message;
 
-type WebSocketTx = SplitSink<
-    WebSocketStream<Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>>,
-    tungstenite::Message,
->;
-type WebSocketRx = SplitStream<
-    WebSocketStream<Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>>,
->;
+type TokioWebSocketStream =
+    WebSocketStream<Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>>;
+type WebSocketTx = SplitSink<TokioWebSocketStream, tungstenite::Message>;
+type WebSocketRx = SplitStream<TokioWebSocketStream>;
+
+/// The `ConnectionId` is used as the unique identifier in AWS API Gateway
+/// websocket implementation. Every new websocket connection is assigned a
+/// unique ConnectionId when the connection is established. We use this to specify
+/// which websocket connection to send responses to.
+type ConnectionId = String;
+
+/// The clients might start sending ICE candidates before we have received their
+/// remote descriptions. So we will need to buffer the candidates temporarily in
+/// this structure and only register them once the remote description have been
+/// registered for the given websocket connect.
+type CandidatesBuffer = Arc<Mutex<HashMap<ConnectionId, Vec<RTCIceCandidateInit>>>>;
 
 pub const DEFAULT_STUN_SERVER: &str = "stun:stun.l.google.com:19302";
 pub const DEFAULT_CONFIG_PATH: &str = "ffmpeg.cfg";
-
-pub const OFFER: &str = "offer";
-pub const ANSWER: &str = "answer";
-pub const CANDIDATE: &str = "candidate";
-/// Sent from the signaling server to the producer when a new client is connected.
-pub const CONNECT: &str = "connect";
-/// Disonnect message sent from signaling server to producer when a client
-/// websocket connection is torn down.
-pub const DISCONNECT: &str = "disconnect";
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
@@ -155,7 +162,7 @@ async fn video_stream_writer(
 
     loop {
         let nal = h264_reader.next_nal().await?;
-        //println!("{}", nal.unit_type);
+        println!("{}", nal.unit_type);
         video_track
             .write_sample(&Sample {
                 data: nal.data.freeze(),
@@ -176,11 +183,17 @@ async fn websocket_listener(
 
     let (ws_tx, mut ws_rx) = ws_stream.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
+
     let mut rtc_conns = HashMap::default();
+    let candidates_buffer = Arc::new(Mutex::new(HashMap::default()));
+
+    let ws_tx_clone = Arc::clone(&ws_tx);
+    tokio::spawn(async move { websocket_pinger(ws_tx_clone).await });
 
     loop {
         if let Err(err) = handle_message(
             &mut rtc_conns,
+            Arc::clone(&candidates_buffer),
             Arc::clone(&ws_tx),
             &mut ws_rx,
             Arc::clone(&video_track),
@@ -188,14 +201,35 @@ async fn websocket_listener(
         )
         .await
         {
-            println!("Error in websocket_handler: {}", err);
+            if let io::ErrorKind::BrokenPipe = err.kind() {
+                return Err(err); // Websocket disconnected.
+            } else {
+                println!("Error in websocket_handler: {}", err);
+            }
         }
+    }
+}
+
+/// Sends a websocket `ping` message over the `ws_tx` websocket stream periodically
+/// every 9 minutes. The default keep-alive time for the API Gateway websockets
+/// are 10 minutes, so make sure to send at least one keep-alive message in that
+/// time.
+async fn websocket_pinger(ws_tx: Arc<Mutex<WebSocketTx>>) -> io::Result<()> {
+    let start = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(60 * 9)).await;
+        println!(
+            "Sending a ping to signaling server (elapsed: {:?})",
+            start.elapsed()
+        );
+        send_ping(Arc::clone(&ws_tx)).await.map_err(to_io_err)?;
     }
 }
 
 /// Teceive the next message on the websocket connection and handles it accordingly.
 async fn handle_message(
-    rtc_conns: &mut HashMap<String, RTCPeerConnection>,
+    rtc_conns: &mut HashMap<ConnectionId, RTCPeerConnection>,
+    candidates_buffer: CandidatesBuffer,
     ws_tx: Arc<Mutex<WebSocketTx>>,
     ws_rx: &mut WebSocketRx,
     video_track: Arc<TrackLocalStaticSample>,
@@ -205,7 +239,7 @@ async fn handle_message(
         Some(msg_result) => msg_result,
         None => {
             return Err(io::Error::new(
-                io::ErrorKind::Other,
+                io::ErrorKind::BrokenPipe,
                 "Websocket closed when reading message.".to_string(),
             ));
         }
@@ -221,205 +255,199 @@ async fn handle_message(
         }
     };
 
-    let tungstenite_msg_bin = tungstenite_msg.into_data();
-    if tungstenite_msg_bin.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Received empty packet on websocket.".to_string(),
-        ));
-    }
+    // We only expect text messages or ping/pong messages. The ping/pong messages
+    // are used to keep the websocket connection alive.
+    let raw_msg = match tungstenite_msg {
+        tungstenite::Message::Text(text) => text,
+        tungstenite::Message::Ping(_) => return handle_ping(ws_tx).await,
+        tungstenite::Message::Pong(_) => return Ok(()),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Received unexpected packet on websocket: {:#?}",
+                    tungstenite_msg
+                ),
+            ))
+        }
+    };
 
-    let msg = match std::str::from_utf8(&tungstenite_msg_bin) {
-        Ok(raw_msg) => match serde_json::from_str::<Message>(raw_msg) {
-            Ok(msg) => msg,
-            Err(err) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Unable to parse message as json.\nMessage: {:?}\nErr: {}",
-                        raw_msg, err
-                    ),
-                ));
-            }
-        },
+    let msg = match serde_json::from_str::<Message>(&raw_msg) {
+        Ok(msg) => msg,
         Err(err) => {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
-                    "Error when parsing message as UTF-8.\nMessage: {:?}\nErr: {}",
-                    tungstenite_msg_bin, err
+                    "Unable to parse message as json.\nMessage: {:?}\nErr: {}",
+                    raw_msg, err
                 ),
             ));
         }
     };
 
-    match msg.action.as_str() {
-        CONNECT => {
-            handle_connect(
-                rtc_conns,
-                Arc::clone(&ws_tx),
-                Arc::clone(&video_track),
-                stun_url,
-                &msg,
-            )
-            .await
+    match msg {
+        Message::Candidate {
+            id,
+            data: candidate,
+        } => {
+            handle_candidate(rtc_conns, candidates_buffer, id, candidate.fix_to()).await?;
         }
 
-        DISCONNECT => handle_disconnect(rtc_conns, &msg).await,
+        Message::Disconnect { id } => {
+            rtc_conns.remove(&id);
+        }
 
-        OFFER => handle_offer(rtc_conns, Arc::clone(&ws_tx), &msg).await,
+        Message::Offer {
+            id,
+            data: remote_desc,
+        } => {
+            let rtc_conn = handle_offer(
+                Arc::clone(&ws_tx),
+                Arc::clone(&video_track),
+                Arc::clone(&candidates_buffer),
+                stun_url,
+                id.clone(),
+                remote_desc,
+            )
+            .await?;
+            rtc_conns.insert(id, rtc_conn);
+        }
 
-        CANDIDATE => handle_candidate(rtc_conns, &msg).await,
+        Message::Response { r#type, data } => {
+            println!(
+                "Received reponse from signaling server. type: {}, message: {}",
+                r#type, data
+            );
+        }
 
-        _ => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Received invalid action in message from client with ID {}: {}",
-                msg.id, msg.action
-            ),
-        )),
+        Message::Answer {
+            id,
+            data: remote_desc,
+        } => {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Received unexpected answer ffrom client with ID {}. Remote desc: {:#?}",
+                    id, remote_desc
+                ),
+            ))
+        }
     }
+
+    Ok(())
 }
 
-/// Handles a received "connect" message.
-async fn handle_connect(
-    rtc_conns: &mut HashMap<String, RTCPeerConnection>,
+/// Handles a received Websocket "ping" message. Need to respond with a "pong".
+async fn handle_ping(ws_tx: Arc<Mutex<WebSocketTx>>) -> io::Result<()> {
+    println!("Received WebRTC ping from signaling server.");
+    send_pong(ws_tx).await.map_err(to_io_err)
+}
+
+/// Handles a received "offer" message.
+async fn handle_offer(
     ws_tx: Arc<Mutex<WebSocketTx>>,
     video_track: Arc<TrackLocalStaticSample>,
+    candidates_buffer: CandidatesBuffer,
     stun_url: &str,
-    msg: &Message,
-) -> io::Result<()> {
-    println!("WebRTC connect from client with ID: {}", msg.id);
+    client_id: ConnectionId,
+    remote_desc: RTCSessionDescription,
+) -> io::Result<RTCPeerConnection> {
+    println!("Received WebRTC offer from client with ID: {}", client_id);
 
     let rtc_conn = setup_rtc_connection(
         Arc::clone(&ws_tx),
         Arc::clone(&video_track),
         stun_url,
-        msg.id.clone(),
+        client_id.clone(),
     )
     .await
     .map_err(to_io_err)?;
-    rtc_conns.insert(msg.id.clone(), rtc_conn);
 
-    Ok(())
-}
+    rtc_conn
+        .set_remote_description(remote_desc)
+        .await
+        .map_err(to_io_err)?;
 
-/// Handles a received "disconnect" message.
-async fn handle_disconnect(
-    rtc_conns: &mut HashMap<String, RTCPeerConnection>,
-    msg: &Message,
-) -> io::Result<()> {
-    println!("WebRTC disconnect from client with ID: {}", msg.id);
+    let local_desc = rtc_conn.create_answer(None).await.map_err(to_io_err)?;
+    let response_msg = Message::Answer {
+        id: client_id.clone(),
+        data: local_desc.clone(),
+    };
 
-    rtc_conns.remove(&msg.id);
+    send(Arc::clone(&ws_tx), response_msg)
+        .await
+        .map_err(to_io_err)?;
 
-    Ok(())
-}
+    rtc_conn
+        .set_local_description(local_desc)
+        .await
+        .map_err(to_io_err)?;
 
-/// Handles a received "offer" message.
-async fn handle_offer(
-    rtc_conns: &HashMap<String, RTCPeerConnection>,
-    ws_tx: Arc<Mutex<WebSocketTx>>,
-    msg: &Message,
-) -> io::Result<()> {
-    println!("WebRTC offer from client with ID: {}", msg.id);
-
-    let remote_desc = serde_json::from_str::<RTCSessionDescription>(&msg.data).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Unable to parse offer from client with ID {}: {}",
-                msg.id, err
-            ),
-        )
-    })?;
-
-    if let Some(rtc_conn) = rtc_conns.get(&msg.id) {
-        rtc_conn
-            .set_remote_description(remote_desc)
-            .await
-            .map_err(to_io_err)?;
-
-        let local_desc = rtc_conn.create_answer(None).await.map_err(to_io_err)?;
-        let local_desc_str = serde_json::to_string(&local_desc).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Unable to create local desc for client with ID {}: {}",
-                    msg.id, err
-                ),
-            )
-        })?;
-
-        let response_msg = Message {
-            id: msg.id.clone(),
-            action: ANSWER.to_string(),
-            data: local_desc_str,
-        };
-        send(Arc::clone(&ws_tx), response_msg)
-            .await
-            .map_err(to_io_err)?;
-
-        rtc_conn
-            .set_local_description(local_desc)
-            .await
-            .map_err(to_io_err)?;
-
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Unable to find connection with ID {} when receiving offer.",
-                msg.id,
-            ),
-        ))
+    // Now that the remote description have been set, we can register any
+    // buffered candidates from the remote client.
+    let mut candidates_buffer_guard = candidates_buffer.lock().await;
+    if let Some(candidates) = candidates_buffer_guard.remove(&client_id) {
+        println!(
+            "Registering {} candidates from client with ID {}",
+            candidates.len(),
+            client_id
+        );
+        for candidate in candidates {
+            rtc_conn
+                .add_ice_candidate(candidate)
+                .await
+                .map_err(to_io_err)?;
+        }
     }
+
+    Ok(rtc_conn)
 }
 
 /// Handles a received "candidate"/"candidate_client" message.
 async fn handle_candidate(
-    rtc_conns: &HashMap<String, RTCPeerConnection>,
-    msg: &Message,
+    rtc_conns: &HashMap<ConnectionId, RTCPeerConnection>,
+    candidates_buffer: CandidatesBuffer,
+    id: ConnectionId,
+    candidate: RTCIceCandidateInit,
 ) -> io::Result<()> {
-    println!("WebRTC ICE candidate from ID: {}", msg.id);
+    println!("Received WebRTC ICE candidate from client with ID: {}", id);
 
-    let candidate = serde_json::from_str::<RTCIceCandidateInitFix>(&msg.data)
-        .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Unable to parse ICE candidate from client with ID {}: {}",
-                    msg.id, err
-                ),
-            )
-        })
-        .unwrap();
+    // Need to lock buffers before checking the state of the connection to
+    // handle edge case where the connection state changes to `Connected` just
+    // before we insert the candidate in the buffer. In those cases we now
+    // force the "task"/"thread" that is in the process of moving the candidates
+    // from the buffers to wait until we have inserted this candidate.
+    let mut candidates_buffer_guard = candidates_buffer.lock().await;
 
-    if let Some(rtc_conn) = rtc_conns.get(&msg.id) {
-        rtc_conn
-            .add_ice_candidate(candidate.fix_to())
-            .await
-            .map_err(to_io_err)?;
-
-        Ok(())
+    if let Some(rtc_conn) = rtc_conns.get(&id) {
+        if let RTCPeerConnectionState::Connected = rtc_conn.connection_state() {
+            rtc_conn
+                .add_ice_candidate(candidate)
+                .await
+                .map_err(to_io_err)?;
+        } else {
+            candidates_buffer_guard
+                .entry(id)
+                .or_default()
+                .push(candidate);
+        }
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Unable to find connection with ID {} when receiving candidate.",
-                msg.id,
-            ),
-        ))
+        candidates_buffer_guard
+            .entry(id)
+            .or_default()
+            .push(candidate);
     }
+
+    Ok(())
 }
 
-/// Sets up a new RTC connection.
+/// Sets up a new RTC connection and the callback functions to handle the
+/// communication over the RTC connection.
 async fn setup_rtc_connection(
     ws_tx: Arc<Mutex<WebSocketTx>>,
     video_track: Arc<TrackLocalStaticSample>,
     stun_url: &str,
-    client_id: String,
+    client_id: ConnectionId,
 ) -> webrtc::error::Result<RTCPeerConnection> {
     // TODO: Only register h264 codecs? Is probably the only thing that we will
     //       be using, so unnecessary to register every default codec.
@@ -444,12 +472,6 @@ async fn setup_rtc_connection(
 
     let rtc_conn = api.new_peer_connection(config).await?;
 
-    // TODO: Do we need to listen for traffic on the `rtp_sender`? What kind
-    //       of traffic can we receive on it?
-    rtc_conn
-        .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
-        .await?;
-
     let client_id_ice = client_id.clone();
     rtc_conn
         .on_ice_connection_state_change(Box::new(move |ice_conn_state| {
@@ -473,12 +495,17 @@ async fn setup_rtc_connection(
         .await;
 
     rtc_conn
+        .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await?;
+
+    let client_id_candidate = client_id.clone();
+    rtc_conn
         .on_ice_candidate(Box::new(move |ice_candidate| {
             let ws_tx = Arc::clone(&ws_tx);
-            let client_id = client_id.clone();
+            let client_id = client_id_candidate.clone();
             Box::pin(async move {
-                if let Some(ice_candidate) = ice_candidate {
-                    let candidate = ice_candidate
+                if let Some(candidate) = ice_candidate {
+                    let candidate_init = candidate
                         .to_json()
                         .await
                         .map_err(|err| {
@@ -489,20 +516,11 @@ async fn setup_rtc_connection(
                         })
                         .unwrap();
 
-                    let candidate_json = serde_json::to_string(&candidate)
-                        .map_err(|err| {
-                            format!(
-                                "Unable to parse ICE candidate from json for client with ID {}: {}",
-                                client_id, err
-                            )
-                        })
-                        .unwrap();
-
-                    let msg = Message {
+                    let msg = Message::Candidate {
                         id: client_id.clone(),
-                        action: CANDIDATE.to_string(),
-                        data: candidate_json,
+                        data: RTCIceCandidateInitFix::fix_from(candidate_init),
                     };
+
                     send(Arc::clone(&ws_tx), msg)
                         .await
                         .map_err(|err| {
@@ -527,6 +545,24 @@ async fn send(ws_tx: Arc<Mutex<WebSocketTx>>, msg: Message) -> webrtc::error::Re
         .send(tungstenite::Message::Text(
             serde_json::to_string(&msg).map_err(|e| webrtc::error::Error::new(format!("{}", e)))?,
         ))
+        .await
+        .map_err(|e| webrtc::error::Error::new(format!("{}", e)))
+}
+
+/// Send a websocket `ping` over the given `ws_tx` websocket stream.
+async fn send_ping(ws_tx: Arc<Mutex<WebSocketTx>>) -> webrtc::error::Result<()> {
+    let mut ws_tx_guard = ws_tx.lock().await;
+    ws_tx_guard
+        .send(tungstenite::Message::Ping(Vec::with_capacity(0)))
+        .await
+        .map_err(|e| webrtc::error::Error::new(format!("{}", e)))
+}
+
+/// Send a websocket `pong` over the given `ws_tx` websocket stream.
+async fn send_pong(ws_tx: Arc<Mutex<WebSocketTx>>) -> webrtc::error::Result<()> {
+    let mut ws_tx_guard = ws_tx.lock().await;
+    ws_tx_guard
+        .send(tungstenite::Message::Pong(Vec::with_capacity(0)))
         .await
         .map_err(|e| webrtc::error::Error::new(format!("{}", e)))
 }

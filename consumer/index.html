@@ -17,17 +17,19 @@
                 width: 1280px;
                 height: auto;
             }
-            div {
-                padding-top: 10px;
-            }
         </style>
     </head>
     <body>
-        URL: <input id="url" type="text" size="50">
-        <button onclick="setupRtc(); connect();">Connect</button>
-        <button onclick="disconnect();">Disconnect</button>
-        <div>
-            <video id="video" autoplay muted>
+        <div id="connect" style="display: block;">
+            URL: <input id="url" type="text" size="50">
+            <button onclick="setupRtc(); connect();">Connect</button>
+        </div>
+        <div id="disconnect" style="display: none;">
+            <button onclick="disconnect();">Disconnect</button>
+        </div>
+        <div id="status" style="display: none;"></div>
+        <div style="padding-top: 10px;">
+            <video id="video" autoplay controls muted>
                 Video not supported by your browser.
             </video>
         </div>
