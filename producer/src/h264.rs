@@ -31,8 +31,6 @@ impl From<H264Error> for webrtc::Error {
 /// NAL H.264 Network Abstraction Layer
 #[allow(clippy::upper_case_acronyms)]
 pub struct NAL {
-    pub picture_order_count: u32,
-
     /// NAL header
     pub forbidden_zero_bit: bool,
     pub ref_idc: u8,
@@ -45,7 +43,6 @@ pub struct NAL {
 impl NAL {
     fn new(data: BytesMut) -> Self {
         NAL {
-            picture_order_count: 0,
             forbidden_zero_bit: false,
             ref_idc: 0,
             unit_type: NalUnitType::Unspecified,

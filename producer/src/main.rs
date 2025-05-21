@@ -42,7 +42,7 @@ use webrtc::{
     track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
 };
 
-use crate::message::{Message, RTCIceCandidateInitFix};
+use crate::message::Message;
 
 mod h264;
 mod message;
@@ -290,7 +290,7 @@ async fn handle_message(
             id,
             data: candidate,
         } => {
-            handle_candidate(rtc_conns, candidates_buffer, id, candidate.fix_to()).await?;
+            handle_candidate(rtc_conns, candidates_buffer, id, candidate).await?;
         }
 
         Message::Disconnect { id } => {
@@ -518,7 +518,7 @@ async fn setup_rtc_connection(
 
                     let msg = Message::Candidate {
                         id: client_id.clone(),
-                        data: RTCIceCandidateInitFix::fix_from(candidate_init),
+                        data: candidate_init,
                     };
 
                     send(Arc::clone(&ws_tx), msg)
