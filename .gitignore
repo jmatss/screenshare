@@ -1,3 +1,6 @@
+**/.terraform/*
+*.tfstate
+*.tfstate.*
 
 # Created by https://www.toptal.com/developers/gitignore/api/java,maven,rust,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=java,maven,rust,visualstudiocode
